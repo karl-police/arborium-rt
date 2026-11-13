@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
+    workflow_dispatch:
     branches:
       - main
-      - patch-4
   pull_request:
   workflow_call:
     outputs:
