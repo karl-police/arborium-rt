@@ -316,6 +316,21 @@ short slot strings like `"k"`, `"f"`, `"s"` that consumers map to colors
 themselves. arborium-rt does **not** bundle any theme CSS; styling is
 the consumer's responsibility.
 
+### Playground site (`site/`)
+
+Private Vite app (`@discord/arborium-rt-site`, never published) for checking
+highlighting by eye in a browser. It imports the workspace
+`@discord/arborium-rt-wasm`, so that package's `dist/` (host, runtime,
+grammars, `grammars.js`) has to be built first. It loads injected grammars on
+demand, and an `ALIASES` table in `site/src/main.ts` maps fence names like
+`js` to bundled ids. Styling is Tailwind v4 (`@tailwindcss/vite`) using only
+default-scale utilities (no arbitrary `[...]` values), and the page follows the
+OS light/dark preference via `dark:` variants. The tag colors in
+`site/src/tags.ts` are the playground's own theme: a light + `dark:` palette
+class pair per slot, added to every token element the page renders. `pnpm --filter @discord/arborium-rt-site dev` serves
+it. The production script is named `bundle`, not `build`, so CI's
+`pnpm -r build` skips it.
+
 ### Dev CLI (`cli/`)
 
 Private, unpublished workspace package. Run directly from source via tsx
@@ -360,10 +375,15 @@ Two pinned submodules live under `third_party/`:
       tick `FUEL_PER_OPERATION + FUEL_PER_LIVE_STATE × live states` and
       breaks when the caller's allotment is spent
       (`parse_with_fuel` / `parse_utf16_with_fuel`). Unpublished upstream.
-    - `arborium-tree-sitter` — **patched** twice: to skip static
+    - `arborium-tree-sitter` — **patched** three times: to skip static
       tree-sitter C linking on emscripten (the MAIN_MODULE resolves those
-      symbols), and to publish the cursor's in-progress match count on
-      `TSQueryCursorState` so the fuel meter can weight by it.
+      symbols), to publish the cursor's in-progress match count on
+      `TSQueryCursorState` so the fuel meter can weight by it, and to add a
+      `regex-lite` feature (enabled by the root `Cargo.toml`) that compiles
+      `#match?` predicates with regex-lite instead of regex. The regex crate's
+      automata, literal optimizations and Unicode tables were ~80% of the
+      runtime SIDE_MODULE; every bundled query regex is a simple ASCII
+      pattern, and regex-lite is still linear-time.
     - `arborium-wire` — **patched** to carry `fuel_used` / `out_of_fuel`
       on both `ParseResult` types. Unpublished upstream.
     - `arborium-highlight`, `arborium-theme` — consumed with
@@ -387,6 +407,35 @@ Two pinned submodules live under `third_party/`:
   which is one-shot per file. The arborium-tree-sitter runtime already
   handles `large_state_count == 0` (every lookup goes through the
   sparse path; cf. `crates/arborium-tree-sitter/src/language.h:78`).
+  A second patch (`patches/tree-sitter/0002-derived-tables-render.patch`)
+  adds `TREE_SITTER_DERIVED_TABLES`, which `build wasm grammar` also sets.
+  It makes the generated tables compress better while keeping the work to
+  restore them at load to one linear pass:
+  - parse states are renumbered so each LR(0) core's states are adjacent,
+    with cores chained greedily by similarity (0 and 1 keep their ids);
+  - action list ids are assigned in the order the small parse table emits
+    them, and each list's first occurrence is emitted as `0`;
+  - `ts_small_parse_table_map` is omitted (it's the prefix sum of row
+    lengths) and `ts_primary_state_ids` is stored as `state - primary`.
+  A generated `ts_derive_tables()` restores all of it on the first
+  `tree_sitter_<lang>()` call. Measured on 13 grammars (json..cpp) at
+  brotli -11: −30.6% total (cpp −36.7%, rust −33.3%; json +90 bytes);
+  gzip -6 −25.3%. Raw size is ~1% *larger*, because emscripten doesn't
+  assume zeroed memory for SIDE_MODULEs and stores the derived arrays as
+  zero bytes (which compress to nothing). The derive pass costs 0.002 ms
+  (json), 0.17 ms (python), ~1.1 ms (cpp) cold in V8; lean, the largest
+  grammar, should be ~4 ms but hasn't been measured (it OOMs `generate` in
+  a 3 GB sandbox).
+  The tables are **isomorphic, not byte-identical**, to stock output:
+  under a state permutation every lookup, action, lex mode and core class
+  matches. Verified on all 13 grammars by a table-level isomorphism check,
+  identical parse trees on real files and on 5,200 corrupted snippets
+  (~95% hit error recovery), including incremental reparses, and parse
+  time within noise. The Node addon build does not set this flag.
+  This is a middle ground to the packed-table codec proposed in PR #12 (−58.6% at
+  brotli -11, but 23–213 ms of decoding at load): PR #12's table
+  re-rendering step alone costs ~90 ms for cpp, so anything that rebuilds
+  grouped rows from a semantic model can't fit a few-ms budget.
   Note that **only the CLI** comes from this submodule: the tree-sitter C
   that actually runs is arborium's vendored copy
   (`crates/arborium-tree-sitter/src/`), compiled into the MAIN_MODULE host
@@ -421,7 +470,7 @@ bootstrap after bumping either submodule or tweaking a patch.
 ### Target layout
 
 - `target/wasm32-unknown-emscripten/release/arborium_rt_wasm.wasm`
-  — Rust SIDE_MODULE output (~1.1 MB uncompressed), emitted by the
+  — Rust SIDE_MODULE output (~230 KB uncompressed), emitted by the
   `arborium-rt-wasm` cdylib. `package wasm host` copies it into the runtime
   package's `dist/runtime/arborium_emscripten_runtime.wasm` (the published filename).
 - `target/host-wasm/web-tree-sitter.{wasm,mjs}` — MAIN_MODULE host.
@@ -487,6 +536,29 @@ means the `.cargo/config.toml` `EXPORTED_FUNCTIONS` list is out of sync.
   the dense layout, point `build wasm grammar` at an unpatched binary and
   unset the env var; the wasm will be 2–4× larger but the parse tree
   will be byte-identical.
+- **Derived tables.** `build wasm grammar` also sets
+  `TREE_SITTER_DERIVED_TABLES=1` (patch 0002). Consequences:
+  - State ids and action list ids in a grammar's `parser.c` differ from a
+    stock `tree-sitter generate` of the same grammar. Don't compare them
+    across the two, or against upstream grammar repos' committed parsers.
+  - Anything reading the tables must go through the `TSLanguage` returned
+    by `tree_sitter_<lang>()`, never the static arrays: the map and primary
+    ids are only filled in by that call, and `ts_small_parse_table`
+    contains `0` placeholders until then.
+  - `ts_derive_tables()` writes the small parse table in place, so the
+    first call must not race another first call. Fine for the wasm host
+    (single threaded); keep it that way if this flag ever reaches the
+    Node addon.
+  - Things that measured as *worse* under brotli, so don't "optimize" into
+    them: delta-coding action ids or goto states (+40–100%), PR #12's
+    breadth-first state order without its model (+11%), deduplicating
+    symbol lists (−5% only), splitting the table into streams (no gain).
+    LZ relies on exact repeats of (value, symbol list) pairs; what helps
+    is putting similar rows near each other and not storing first
+    occurrences.
+- **Serving.** Precompress grammar wasm with brotli -11 at build time
+  (−31% vs gzip -6 across the corpus); see the package README's "Serving
+  compressed" section.
 
 ## Conventions worth knowing
 
@@ -499,7 +571,8 @@ means the `.cargo/config.toml` `EXPORTED_FUNCTIONS` list is out of sync.
   own target in the environment:
     - `arborium-rt build wasm runtime` → `arborium-rt-wasm` for
       `wasm32-unknown-emscripten` with `CARGO_BUILD_TARGET` +
-      `CARGO_UNSTABLE_BUILD_STD=std,panic_abort` (the `SIDE_MODULE`/
+      `CARGO_UNSTABLE_BUILD_STD=std,panic_abort` and
+      `CARGO_UNSTABLE_BUILD_STD_FEATURES=optimize_for_size` (the `SIDE_MODULE`/
       `EXPORTED_FUNCTIONS` link-args come from `.cargo/config.toml`). Needs emcc.
     - `arborium-rt build node` → `arborium-rt-node` for the host triple with
       `CARGO_BUILD_TARGET=<host>` (no build-std; the host links prebuilt std).
